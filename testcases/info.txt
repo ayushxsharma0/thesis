@@ -1,0 +1,10 @@
+Format of test cases -> 
+
+-> number of processors
+
+-> Frequencies of each processors
+
+-> maximum energy budget 
+
+-> task parameters in remaining of the lines 
+    (EXEC, DEADLINE, m, k)       
