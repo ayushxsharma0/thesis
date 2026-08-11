@@ -43,8 +43,9 @@ generator and the solver can never disagree about where a file lives.
 
 import math
 import random
+from pathlib import Path
 
-from preprocessing import TESTCASES_DIR
+TESTCASES_DIR = Path(__file__).resolve().parent.parent / "testcases"
 
 
 # =========================

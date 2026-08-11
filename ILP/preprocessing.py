@@ -38,7 +38,7 @@ from pathlib import Path
 # re-derive it)
 # =========================
 
-TESTCASES_DIR = Path(__file__).resolve().parent.parent / "testcases"
+TESTCASES_DIR = Path(__file__).resolve().parent.parent / "testcases/batch_v1"
 
 
 # =========================

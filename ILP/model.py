@@ -24,7 +24,7 @@ from preprocessing import preprocess, TESTCASES_DIR
 # (imported from preprocessing.py), so as long as the filename string
 # matches, the two scripts can never end up looking at different files.
 
-TESTCASE_FILENAME = "t3.txt"
+TESTCASE_FILENAME = "t0010.txt"
 TIME_LIMIT_SECONDS = None   # e.g. 300 to cap solve time; None = no limit
 
 
