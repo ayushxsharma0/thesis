@@ -14,7 +14,7 @@ from gurobipy import GRB
 
 from preprocessing import preprocess, TESTCASES_DIR
 
-
+ 
 # =========================
 # CONFIG
 # =========================
@@ -24,7 +24,7 @@ from preprocessing import preprocess, TESTCASES_DIR
 # (imported from preprocessing.py), so as long as the filename string
 # matches, the two scripts can never end up looking at different files.
 
-TESTCASE_FILENAME = "t0010.txt"
+TESTCASE_FILENAME = "t0004.txt"
 TIME_LIMIT_SECONDS = None   # e.g. 300 to cap solve time; None = no limit
 
 
@@ -225,6 +225,7 @@ if model.SolCount > 0:
     print("\nPhi:", Phi.X)
     print("Total Energy:", total_energy.getValue())
 
+                   
     ilp_phi = Phi.X
     ilp_patterns = {
         i: [round(Y[i, j].X) for j in jobs[i]]

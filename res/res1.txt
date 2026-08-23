@@ -1,0 +1,26 @@
+TESTCASE
+1
+0.5 0.75 1.0
+101.88
+1 4 1 2
+1 8 2 4
+1 16 1 3
+1 32 1 2
+13 64 1 2
+11 128 1 2
+
+
+For the above test case -> 
+
+HEURISTIC SOLUTION 
+Phi (unfairness):        0.34375000
+Total energy used:       100.56250000 / budget 101.88
+Jobs demoted by SPS:     0
+C3 violations unresolved: 0
+Heuristic iterations:    69
+Stopped because:         no job of task 0 (worst, gamma=0.3438) is schedulable
+
+
+ILP SOLUTION 
+Phi: 0.3333333333333333
+Total Energy: 101.6875
