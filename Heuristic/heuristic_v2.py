@@ -1,68 +1,51 @@
 """
-heuristic1.py -- Heuristic 1 (initial version, devised with guide).
+heuristic2_lookahead.py -- Heuristic 2: lookahead search over job choice.
 
-Pipeline:
-  1. E-pattern generation: evenly-distributed distance-based mu-pattern
-     per task, satisfying (m,k) exactly for every sliding window.
-  2. SPS: combine all per-task patterns into one processor/frequency-
-     assigned schedule (EDF order, demoting jobs that don't fit once
-     tasks share processors).
-  3. C3 repair: fix any (m,k) violations introduced by SPS's demotions
-     (Stage 1's pattern has zero slack, so any demotion breaks C3 for
-     every window containing that job -- see repair_violations()).
-  4. Heuristic loop:
-       - sort tasks by DESCENDING unfairness (gamma_i), worst first
-       - take the worst task; try its unscheduled jobs in natural order
-         (job 1, 2, 3, ...)
-       - for each job, try processors in order (0, 1, 2, ...), and
-         within each processor try frequencies LOWEST first (cheapest
-         energy first)
-       - on the first feasible (job, processor, frequency): schedule it,
-         recompute unfairness for every task, re-sort, and restart the
-         loop (the new worst task may or may not be the same one)
-       - if NO job of the current worst task is schedulable on ANY
-         processor at ANY frequency: STOP THE ENTIRE HEURISTIC
-         immediately (by design -- this version does not fall back to
-         improving a different task)
+Same Stage 1-3 as Heuristic 1 (E-pattern -> SPS -> C3 repair). Stage 4
+replaces the greedy "always take the worst task's first feasible job in
+natural order" rule with an EXHAUSTIVE LOOKAHEAD SEARCH to a fixed depth
+d:
 
-IMPLEMENTATION NOTE on the feasibility check: the design as described
-checks feasibility by computing the demand bound function (DBF) over a
-job's [activation, deadline] interval against everything already
-scheduled there. This implementation uses an EQUIVALENT but much more
-efficient check instead -- direct preemptive EDF feasibility simulation
-(same notion of feasibility, a standard result in real-time scheduling
-theory, but O(n log n) per check instead of enumerating every candidate
-interval). This matters in practice: the naive interval-enumeration
-approach can blow up to out-of-memory on larger testcases (verified
-directly on Baseline 1, where it went from crashing to running in 0.3s
-after this same swap) since it mirrors the ILP's own exhaustive
-constraint count, which can reach into the millions.
+  At each node (a tentative schedule state), identify the current worst
+  task (by gamma_i -- this can differ node to node, since committing a
+  job changes gammas). Branch on EVERY feasible job of that task (no
+  beam-width pruning -- every branch is kept, per confirmed design).
+  Recurse to depth d. Score each leaf by (Phi, total_energy), lower Phi
+  better, ties broken by lower energy. Whichever FIRST-level candidate
+  leads to the best leaf is the one actually committed. Then the WHOLE
+  search restarts from scratch for the next decision (most accurate,
+  most expensive option, per confirmed design).
 
-Self-contained: pattern generation, feasibility tracking, SPS, and C3
-repair are all inlined in this single file (no imports from other
-baseline/ILP folders), with only a local copy of preprocessing.py as a
-dependency, consistent with the rest of this project's folder layout.
+COMPLEXITY WARNING (confirmed as an accepted tradeoff by design, to be
+measured empirically rather than assumed): with no beam-width pruning
+and a branching factor of "all feasible jobs" at each level, the search
+tree size grows roughly as (branching factor)^d per SINGLE real
+scheduling decision, and this whole search re-runs from scratch after
+every decision. This file reports wall-clock time for both testcases
+tested so the actual cost can be judged directly rather than guessed.
+If this turns out too slow, the two documented levers (from the
+whiteboard's "Adaptive" refinement, not yet implemented here) are:
+reducing d, and/or capping the branching factor instead of using every
+feasible job.
 
-Usage: python heuristic1.py <testcase_filename>
-       (filename resolved against preprocessing.TESTCASES_DIR)
+For a given candidate job (not proc/freq), placement still follows the
+same deterministic rule as Heuristic 1: try processors in sequential
+order, frequencies lowest-first, first feasible combo wins. Branching is
+over WHICH JOB only, not which processor/frequency, per the whiteboard.
 """
 
 import sys
 import heapq
+import copy
 
 from preprocessing import preprocess, TESTCASES_DIR
 
 
 # =========================
-# STAGE 1: E-PATTERN (evenly-distributed pattern generation)
+# STAGE 1: E-PATTERN
 # =========================
 
 def generate_evenly_pattern(tasks, jobs):
-    """
-    Distance-based pattern: job j accepted iff floor(j*m/k) !=
-    floor((j-1)*m/k). Satisfies (m,k) exactly for every sliding window.
-    Returns: pattern[i][j] = 1 (accept) or 0 (skip)
-    """
     pattern = {}
     for i, (e, p, m, k) in enumerate(tasks):
         pattern[i] = {}
@@ -78,13 +61,6 @@ def generate_evenly_pattern(tasks, jobs):
 # =========================
 
 class SchedulerState:
-    """
-    Tracks, per processor, the set of committed jobs (arrival, deadline,
-    execution time). Checks C2 (timing) feasibility via direct
-    preemptive EDF simulation, and C4 (energy) via a running total --
-    see module docstring for why EDF simulation is used instead of
-    literal DBF-interval enumeration.
-    """
 
     def __init__(self, tasks, jobs, energy_budget, freq_levels, n_prc, h_bar=1.0):
         self.tasks = tasks
@@ -103,12 +79,31 @@ class SchedulerState:
             for j in jobs[i]:
                 self.assignment[(i, j)] = None
 
+    def clone(self):
+        """
+        Lightweight clone for lookahead branching: shares the immutable
+        tasks/jobs/freq_levels references, copies only the mutable
+        scheduling state. Much cheaper than a generic deepcopy, since
+        tasks/jobs never change during search.
+        """
+        new_state = SchedulerState.__new__(SchedulerState)
+        new_state.tasks = self.tasks
+        new_state.jobs = self.jobs
+        new_state.energy_budget = self.energy_budget
+        new_state.freq_levels = self.freq_levels
+        new_state.n_prc = self.n_prc
+        new_state.h_bar = self.h_bar
+
+        new_state.total_energy = self.total_energy
+        new_state.total_load = dict(self.total_load)
+        new_state.committed = {x: list(jobs_) for x, jobs_ in self.committed.items()}
+        new_state.assignment = dict(self.assignment)
+        return new_state
+
     @staticmethod
     def _is_edf_feasible(job_list):
-        """job_list: list of (arrival, deadline, exec_time)."""
         if not job_list:
             return True
-
         events = sorted(job_list, key=lambda jb: jb[0])
         n = len(events)
         heap = []
@@ -120,15 +115,12 @@ class SchedulerState:
                 arrival, deadline, exec_time = events[idx]
                 heapq.heappush(heap, (deadline, exec_time))
                 idx += 1
-
             if not heap:
                 t = events[idx][0]
                 continue
-
             deadline, remaining = heapq.heappop(heap)
             next_arrival = events[idx][0] if idx < n else float("inf")
             time_slice = remaining if next_arrival == float("inf") else min(remaining, next_arrival - t)
-
             if time_slice >= remaining - 1e-9:
                 finish_time = t + remaining
                 if finish_time > deadline + 1e-9:
@@ -138,7 +130,6 @@ class SchedulerState:
                 remaining -= time_slice
                 t = next_arrival
                 heapq.heappush(heap, (deadline, remaining))
-
         return True
 
     def can_place(self, i, j, x, f):
@@ -166,17 +157,14 @@ class SchedulerState:
         deadline = j * p_i
         self.committed[x].append((arrival, deadline, exec_time))
         self.total_load[x] += exec_time
-
         self.total_energy += self.h_bar * (f_y ** 2) * e_i
         self.assignment[(i, j)] = (x, f)
 
     def try_place_best(self, i, j, freq_order=None):
-        """Used by SPS and C3 repair: least-loaded processor first, given freq_order."""
+        """Used by SPS and C3 repair: least-loaded processor first."""
         if freq_order is None:
             freq_order = range(len(self.freq_levels))
-
         proc_order = sorted(range(self.n_prc), key=lambda x: self.total_load[x])
-
         for x in proc_order:
             for f in freq_order:
                 if self.can_place(i, j, x, f):
@@ -184,24 +172,34 @@ class SchedulerState:
                     return True
         return False
 
+    def find_first_feasible_placement(self, i, j):
+        """
+        Sequential processor order, lowest-frequency-first (matching
+        Heuristic 1's placement rule). Returns (x, f) or None. Does NOT
+        commit -- used to check whether a candidate job is feasible at
+        all, for lookahead branching.
+        """
+        for x in range(self.n_prc):
+            for f in range(len(self.freq_levels)):
+                if self.can_place(i, j, x, f):
+                    return (x, f)
+        return None
+
 
 # =========================
-# STAGE 2: SPS (Sum of Partial Solutions)
+# STAGE 2: SPS
 # =========================
 
 def run_sps(tasks, jobs, pattern, energy_budget, freq_levels, n_prc, h_bar=1.0):
     state = SchedulerState(tasks, jobs, energy_budget, freq_levels, n_prc, h_bar)
-
     accepted_jobs = [
         (i, j) for i in range(len(tasks)) for j in jobs[i] if pattern[i][j] == 1
     ]
-    accepted_jobs.sort(key=lambda ij: ij[1] * tasks[ij[0]][1])  # EDF order
-
+    accepted_jobs.sort(key=lambda ij: ij[1] * tasks[ij[0]][1])
     demoted = []
     for (i, j) in accepted_jobs:
         if not state.try_place_best(i, j):
             demoted.append((i, j))
-
     return state, demoted
 
 
@@ -210,7 +208,6 @@ def run_sps(tasks, jobs, pattern, energy_budget, freq_levels, n_prc, h_bar=1.0):
 # =========================
 
 def find_violations(state, tasks, jobs, eta):
-    """Returns list of (task_i, window_start, window_jobs) below m accepted."""
     violations = []
     for i, (e, p, m, k) in enumerate(tasks):
         n = eta[i]
@@ -231,7 +228,6 @@ def repair_violations(state, tasks, jobs, eta, freq_order=None):
         violations = find_violations(state, tasks, jobs, eta)
         if not violations:
             return state, []
-
         fixed_any = False
         for (i, start, window_jobs) in violations:
             m = tasks[i][2]
@@ -241,25 +237,20 @@ def repair_violations(state, tasks, jobs, eta, freq_order=None):
             still_needed = m - accepted_count
             if still_needed <= 0:
                 continue
-
-            skipped_in_window = [
-                j for j in window_jobs if state.assignment[(i, j)] is None
-            ]
+            skipped_in_window = [j for j in window_jobs if state.assignment[(i, j)] is None]
             skipped_in_window.sort(key=lambda j: j * tasks[i][1])
-
             for j in skipped_in_window:
                 if still_needed <= 0:
                     break
                 if state.try_place_best(i, j, freq_order=freq_order):
                     still_needed -= 1
                     fixed_any = True
-
         if not fixed_any:
             return state, find_violations(state, tasks, jobs, eta)
 
 
 # =========================
-# STAGE 4: HEURISTIC LOOP (worst-task-first)
+# STAGE 4: LOOKAHEAD SEARCH (depth d, no beam-width pruning)
 # =========================
 
 def _gamma(state, jobs, i, eta_i):
@@ -267,40 +258,106 @@ def _gamma(state, jobs, i, eta_i):
     return (eta_i - accepted) / eta_i
 
 
-def run_heuristic(state, tasks, jobs, eta, freq_levels, n_prc):
-    n_tsk = len(tasks)
-    n_frq = len(freq_levels)
+def _find_worst_task(state, tasks, jobs, eta):
+    """Returns (worst_gamma, worst_i), or (0.0, None) if all tasks fully accepted."""
+    gammas = [(_gamma(state, jobs, i, eta[i]), i) for i in range(len(tasks))]
+    gammas.sort(reverse=True)
+    worst_gamma, worst_i = gammas[0]
+    if worst_gamma <= 0:
+        return 0.0, None
+    return worst_gamma, worst_i
+
+
+def _enumerate_candidates(state, tasks, jobs, worst_i):
+    """
+    All feasible (job, x, f) triples for the given task's currently
+    unscheduled jobs -- the branching factor (no cap, per confirmed
+    design). Placement (x,f) for each job follows the deterministic
+    sequential-processor / lowest-frequency-first rule; branching is
+    over WHICH JOB only.
+    """
+    candidates = []
+    for j in jobs[worst_i]:
+        if state.assignment[(worst_i, j)] is not None:
+            continue
+        placement = state.find_first_feasible_placement(worst_i, j)
+        if placement is not None:
+            candidates.append((j, placement[0], placement[1]))
+    return candidates
+
+
+def _score(state, tasks, jobs, eta):
+    """(Phi, energy) -- lower is better for both, Phi first."""
+    gammas = [_gamma(state, jobs, i, eta[i]) for i in range(len(tasks))]
+    return (max(gammas), state.total_energy)
+
+
+def _best_leaf_score(state, tasks, jobs, eta, remaining_depth):
+    """
+    Returns the best (Phi, energy) achievable from `state` within
+    `remaining_depth` more decisions. Does not mutate `state`. If no
+    further move is possible (worst task stuck, or all tasks done),
+    the current state's score IS the leaf.
+    """
+    if remaining_depth == 0:
+        return _score(state, tasks, jobs, eta)
+
+    worst_gamma, worst_i = _find_worst_task(state, tasks, jobs, eta)
+    if worst_i is None:
+        return _score(state, tasks, jobs, eta)
+
+    candidates = _enumerate_candidates(state, tasks, jobs, worst_i)
+    if not candidates:
+        return _score(state, tasks, jobs, eta)
+
+    best = None
+    for (j, x, f) in candidates:
+        child = state.clone()
+        child.place(worst_i, j, x, f)
+        leaf = _best_leaf_score(child, tasks, jobs, eta, remaining_depth - 1)
+        if best is None or leaf < best:
+            best = leaf
+    return best
+
+
+def _choose_best_first_move(state, tasks, jobs, eta, depth):
+    """
+    Runs the full lookahead search and returns the (worst_i, j, x, f)
+    first move that leads to the best leaf, or None if the current
+    worst task has zero feasible candidates (the stop condition).
+    """
+    worst_gamma, worst_i = _find_worst_task(state, tasks, jobs, eta)
+    if worst_i is None:
+        return None, "all tasks fully accepted"
+
+    candidates = _enumerate_candidates(state, tasks, jobs, worst_i)
+    if not candidates:
+        return None, f"no job of task {worst_i} (worst, gamma={worst_gamma:.4f}) is schedulable"
+
+    best_move = None
+    best_leaf = None
+    for (j, x, f) in candidates:
+        child = state.clone()
+        child.place(worst_i, j, x, f)
+        leaf = _best_leaf_score(child, tasks, jobs, eta, depth - 1)
+        if best_leaf is None or leaf < best_leaf:
+            best_leaf = leaf
+            best_move = (worst_i, j, x, f)
+
+    return best_move, None
+
+
+def run_heuristic2(state, tasks, jobs, eta, depth):
     iterations = 0
     stop_reason = None
 
     while True:
-        gammas = [(_gamma(state, jobs, i, eta[i]), i) for i in range(n_tsk)]
-        gammas.sort(reverse=True)
-        worst_gamma, worst_i = gammas[0]
-
-        if worst_gamma <= 0:
-            stop_reason = "all tasks fully accepted"
+        move, reason = _choose_best_first_move(state, tasks, jobs, eta, depth)
+        if move is None:
+            stop_reason = reason
             break
-
-        unscheduled = [j for j in jobs[worst_i] if state.assignment[(worst_i, j)] is None]
-
-        scheduled_something = False
-        for j in unscheduled:
-            for x in range(n_prc):
-                for f in range(n_frq):  # lowest frequency first (freq_levels ascending)
-                    if state.can_place(worst_i, j, x, f):
-                        state.place(worst_i, j, x, f)
-                        scheduled_something = True
-                        break
-                if scheduled_something:
-                    break
-            if scheduled_something:
-                break
-
-        if not scheduled_something:
-            stop_reason = f"no job of task {worst_i} (worst, gamma={worst_gamma:.4f}) is schedulable"
-            break
-
+        i, j, x, f = move
+        state.place(i, j, x, f)
         iterations += 1
 
     return state, iterations, stop_reason
@@ -310,7 +367,7 @@ def run_heuristic(state, tasks, jobs, eta, freq_levels, n_prc):
 # MAIN
 # =========================
 
-def run_heuristic1(testcase_filename):
+def run_heuristic2_pipeline(testcase_filename, depth=2):
     (
         n_prc, freq_levels, energy_budget, tasks,
         h_eff, eta, jobs, arrival_times, deadline_times, freq_indices,
@@ -322,12 +379,13 @@ def run_heuristic1(testcase_filename):
     high_freq_first = list(range(len(freq_levels) - 1, -1, -1))
     state, unresolved = repair_violations(state, tasks, jobs, eta, freq_order=high_freq_first)
 
-    state, iterations, stop_reason = run_heuristic(state, tasks, jobs, eta, freq_levels, n_prc)
+    state, iterations, stop_reason = run_heuristic2(state, tasks, jobs, eta, depth)
 
     gammas = [_gamma(state, jobs, i, eta[i]) for i in range(len(tasks))]
 
     return {
         "testcase": testcase_filename,
+        "depth": depth,
         "phi": max(gammas),
         "total_energy": state.total_energy,
         "energy_budget": energy_budget,
@@ -341,10 +399,11 @@ def run_heuristic1(testcase_filename):
 
 if __name__ == "__main__":
     filename = sys.argv[1] if len(sys.argv) > 1 else "t0006.txt"
+    depth = int(sys.argv[2]) if len(sys.argv) > 2 else 2
 
-    result = run_heuristic1(filename)
+    result = run_heuristic2_pipeline(filename, depth=depth)
 
-    print(f"=== Heuristic 1: {result['testcase']} ===")
+    print(f"=== Heuristic 2 (lookahead depth={result['depth']}): {result['testcase']} ===")
     print(f"Resolved path: {TESTCASES_DIR / filename}")
     print()
     for i, g in enumerate(result["gammas"]):
